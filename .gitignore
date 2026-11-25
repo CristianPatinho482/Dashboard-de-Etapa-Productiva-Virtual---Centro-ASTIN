@@ -1,0 +1,22 @@
+# ── Datos personales y salidas generadas (NO versionar) ──────────────
+# El dashboard contiene cédulas, nombres y empresas de aprendices (Ley 1581 de 2012)
+dashboard_etapa_productiva_virtual.html
+outputs/
+data/
+*.csv
+*.xlsx
+*.xls
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ── IDE / SO ──────────────────────────────────────────────────────────
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
+tmp_*
