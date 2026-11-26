@@ -79,9 +79,47 @@ Fechas reglamentarias consideradas:
 
 | Estado | Color | Condición |
 |--------|-------|-----------|
-| AL DÍA | 🟢 `#39A900` | Alternativa + ARL + seguimientos 1, 2 y 3 cargados |
+| AL DÍA | 🟢 `#39A900` | Alternativa + ARL + seguimientos 1, 2 y 3 realizados (GFPI-F-023 V6) |
 | EN PROCESO | 🟡 Amarillo | Alternativa registrada con seguimientos pendientes, **o** sin alternativa pero con plazo de selección aún vigente |
 | ALERTA | 🔴 Rojo | Sin alternativa con plazo de selección vencido, sin ARL, sin documentos, o EP vencida sin cierre |
+
+### Fuente de datos
+
+El script usa como **fuente primaria** el Excel oficial de SharePoint
+(`BASE DE DATOS ETAPA PRODUCTIVA.xlsx`, carpeta "coordinacion" del sitio CentroAstin),
+leído desde su copia local sincronizada por OneDrive. Si el Excel no existe o está
+bloqueado, usa la copia temporal del archivo; el CSV queda como respaldo automático.
+
+## Seguimientos — formato GFPI-F-023 V6
+
+Un seguimiento (1, 2 o 3) se considera **realizado** únicamente cuando existe para el
+aprendiz el formato **GFPI-F-023 V6** "Planeación, Seguimiento y Evaluación de Etapa
+Productiva" diligenciado y firmado por las tres partes (aprendiz, instructor de
+seguimiento y ente co-formador).
+
+- **Detección por contenido**: el script lee el texto interno de TODOS los archivos
+  .pdf/.docx/.doc (los nombres varían: S1_Junio.pdf, escaneos, etc.) y busca el texto
+  `GFPI-F-023 V6`. Los resultados se cachean por mtime (corridas semanales rápidas).
+- **Detección por nombre**: `S1_`, `S2_`, `S3_`, `GFPI-F-023`, `F-023`, `F023` +
+  número de seguimiento en el nombre o en el contenido (Momentos 2/3/4 → Seg 1/2/3).
+- **Asociación al aprendiz**: por cédula/ficha en el nombre, o por los identificadores
+  leídos DENTRO del PDF (cédula y "No. Grupo").
+- **Validación de diligenciamiento**: el formato se evalúa contra el ejemplo oficial:
+  campos críticos (nombre, cédula, ficha, alternativa, fechas de EP, instructor,
+  ente co-formador) deben estar diligenciados; campos no críticos (correos, fecha
+  Sofia Plus, ARL, póliza, jefe inmediato) se reportan como observaciones; la firma
+  digital del PDF se valida, y si no existe se deja observación para revisión manual.
+
+Estados de la columna Seguimiento:
+
+| Estado | Visual | Significado |
+|--------|--------|-------------|
+| Realizado | ✅ | GFPI-F-023 V6 completo (campos críticos diligenciados) |
+| Incompleto | ⚠️ | GFPI existe pero faltan campos críticos (ver tooltip) |
+| Asignado | ⚠️ | Instructor/fecha en CSV, sin formato GFPI |
+| Pendiente | ❌ | Sin formato GFPI y sin asignación |
+
+La asignación de instructor/fecha en el CSV **ya no** acredita el seguimiento.
 
 Preaviso: las fechas a **30 días o menos** de vencer se marcan como ⚠️ "Próximo a vencer".
 

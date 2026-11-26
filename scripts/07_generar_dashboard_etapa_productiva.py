@@ -54,10 +54,18 @@ CONFIG = {
         r"\Mis Bases de Datos\AREA LABORAL\SENA\Contrato 2026 - SENA"
         r"\BASE DE DATOS ETAPA PRODUCTIVA.csv"
     ),
+    # Excel oficial (SharePoint CentroAstin/coordinacion) sincronizado vía OneDrive.
+    # Se usa como fuente PRIMARIA cuando existe; el CSV queda como respaldo.
+    "excel_path": Path(
+        r"C:\Users\capatino\OneDrive - Servicio Nacional de Aprendizaje\BACKUP DISCO"
+        r"\Mis Bases de Datos\AREA LABORAL\SENA\Contrato 2026 - SENA"
+        r"\BASE DE DATOS ETAPA PRODUCTIVA.xlsx"
+    ),
     # Raíz del escaneo de entregables en OneDrive (se recorre recursivamente)
     "onedrive_root": Path(r"C:\Users\capatino\OneDrive - Servicio Nacional de Aprendizaje"),
     "extensiones": {".pdf", ".docx", ".doc"},
     "cache_index": None,  # se resuelve en main() -> data/onedrive_index.json
+    "cache_contenido": None,  # se resuelve en main() -> data/gfpi_contenido_cache.json
     "output_html": None,  # se resuelve en main() -> dashboard_etapa_productiva_virtual.html
     "resumen_dir": None,  # se resuelve en main() -> outputs/
     "excluir_dirnames": {
@@ -91,11 +99,16 @@ def solo_digitos(s):
 
 
 def parsear_fecha(s):
-    """Convierte texto de fecha (DD/MM/AAAA u otros) a datetime.date. None si es inválida."""
-    s = "" if s is None else str(s).strip()
+    """Convierte texto de fecha a datetime.date. None si es inválida.
+    Acepta DD/MM/AAAA, YYYY-MM-DD y datetime de Excel ('2025-08-23 00:00:00')."""
+    if s is None:
+        return None
+    if hasattr(s, "date") and not isinstance(s, str):  # datetime.date/datetime
+        return s.date()
+    s = str(s).strip()
     if not s:
         return None
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y"):
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%y"):
         try:
             return datetime.strptime(s, fmt).date()
         except ValueError:
@@ -140,16 +153,40 @@ def mapear_columnas(df):
     return {normalizar(c): c for c in df.columns}
 
 
-def leer_base_datos(csv_path):
-    """Lee el CSV con codificación UTF-8-sig y separador ; de forma defensiva."""
-    if not csv_path.exists():
-        sys.exit(f"[ERROR] No se encontró el archivo CSV:\n  {csv_path}")
-    try:
-        df = pd.read_csv(csv_path, encoding="utf-8-sig", sep=";", dtype=str)
-    except UnicodeDecodeError:
-        df = pd.read_csv(csv_path, encoding="latin-1", sep=";", dtype=str)
+def leer_base_datos(csv_path, excel_path=None):
+    """
+    Lee la base de datos de forma defensiva.
+    Prefiere el Excel de OneDrive/SharePoint (fuente primaria); si no existe,
+    usa el CSV. En ambos casos: codificación UTF-8-sig, nulos normalizados a ''.
+    Si el Excel está abierto en Excel (bloqueado), se copia a temporal y se lee la copia.
+    """
+    origen = "CSV"
+    df = None
+    if excel_path and excel_path.exists():
+        try:
+            try:
+                df = pd.read_excel(excel_path, dtype=str)
+                origen = f"Excel ({excel_path.name})"
+            except PermissionError:
+                import shutil
+                import tempfile
+                tmp = Path(tempfile.gettempdir()) / ("BD_EP_tmp_" + excel_path.name)
+                shutil.copy2(excel_path, tmp)
+                df = pd.read_excel(tmp, dtype=str)
+                origen = f"Excel ({excel_path.name} — copia temporal, archivo estaba abierto)"
+        except Exception as e:
+            print(f"  [WARN] No se pudo leer el Excel ({e}). Se usará el CSV.")
+            df = None
+    if df is None:
+        if not csv_path.exists():
+            sys.exit(f"[ERROR] No se encontró la base de datos:\n  {csv_path}")
+        try:
+            df = pd.read_csv(csv_path, encoding="utf-8-sig", sep=";", dtype=str)
+        except UnicodeDecodeError:
+            df = pd.read_csv(csv_path, encoding="latin-1", sep=";", dtype=str)
+        origen = f"CSV ({csv_path.name})"
     df = df.fillna("")
-    return df
+    return df, origen
 
 
 def filtrar_virtuales(df):
@@ -178,6 +215,18 @@ RE_SEG_NUM = [
 ]
 RE_BITACORA_NUM = re.compile(r"bit[aá]cora\s*(?:n[o°]?\.?\s*)?(\d{1,2})", re.I)
 
+# Formato GFPI-F-023 V6 "Formato de Planeación, Seguimiento y Evaluación de Etapa
+# Productiva": es el ÚNICO documento que acredita un seguimiento realizado.
+# Nombres típicos: S1_Junio.pdf, S2_Agosto.pdf, S3_Octubre.pdf, GFPI-F-023_..., F-023...
+RE_GFPI_NOMBRE = re.compile(
+    r"GFPI[\s_-]*F[\s_-]*0?23|(?:^|[\s_])S[123](?:[\s_\-.]|$)|(?:^|[\s_\-.(])F[\s_-]*0?23\b",
+    re.I,
+)
+# Número de seguimiento explícito en el nombre: "S1_", "Seguimiento 3", "F-023 S2"
+RE_GFPI_SEG_NOMBRE = re.compile(
+    r"(?:^|[\s_\-.(])(?:seguimiento[\s_-]*)?S?([123])(?:[\s_\-.)]|$)", re.I,
+)
+
 CATEGORIAS = {
     # categoría -> regex de palabras clave (sin tildes, en minúscula)
     "inicio": re.compile(
@@ -194,11 +243,19 @@ CATEGORIAS = {
 def clasificar_archivo(nombre):
     """
     Clasifica un archivo según las 3 categorías de entregables y detecta
-    número de seguimiento / bitácora. Devuelve dict con flags.
+    número de seguimiento / bitácora / formato GFPI-F-023. Devuelve dict con flags.
     """
     n = normalizar(nombre)
     r = {"inicio": False, "seguimiento": False, "cierre": False,
-         "seg_nums": set(), "bitacora_nums": set(), "arl": False}
+         "seg_nums": set(), "bitacora_nums": set(), "arl": False,
+         "gfpi": False, "gfpi_segs": set()}
+    # Formato GFPI-F-023 V6 (acredita seguimiento realizado)
+    if RE_GFPI_NOMBRE.search(n):
+        r["gfpi"] = True
+        for m in RE_GFPI_SEG_NOMBRE.finditer(n):
+            num = int(m.group(1))
+            if 1 <= num <= 3:
+                r["gfpi_segs"].add(num)
     if CATEGORIAS["inicio"].search(n):
         r["inicio"] = True
         if re.search(r"\barl\b|\bafiliaci[oó]n\b", n):
@@ -217,6 +274,248 @@ def clasificar_archivo(nombre):
     if "bitacora" in n and not r["bitacora_nums"]:
         r["bitacora_nums"].add(0)  # bitácora sin número identificable
     return r
+
+
+def extraer_texto_pdf(ruta):
+    """
+    Extrae el texto y el estado de firma digital de un PDF usando PyMuPDF.
+    Devuelve (texto, firmado). El documento se abre UNA sola vez.
+    """
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            import fitz  # PyMuPDF
+        doc = fitz.open(str(ruta))
+        texto = " ".join(p.get_text() for p in doc)
+        try:
+            flags = doc.get_sigflags() if hasattr(doc, "get_sigflags") else 0
+            n = doc.get_sigcount() if hasattr(doc, "get_sigcount") else 0
+        except Exception:
+            flags, n = 0, 0
+        doc.close()
+        return texto, bool(flags & 1) or n > 0
+    except Exception:
+        return "", False
+
+
+def extraer_texto_docx(ruta):
+    """Extrae el texto de un .docx con python-docx. Devuelve '' si falla."""
+    try:
+        import docx
+        d = docx.Document(str(ruta))
+        return " ".join(p.text for p in d.paragraphs)
+    except Exception:
+        return ""
+
+
+def extraer_identificadores_pdf(texto):
+    """
+    Busca en el texto de un PDF números de cédula (6-10 dígitos) y ficha
+    (7 dígitos con etiqueta 'No. Grupo' o similar). Devuelve set de tokens.
+    """
+    tokens = set()
+    if not texto:
+        return tokens
+    # Cédulas: cualquier corrida de 6 a 10 dígitos
+    for m in re.finditer(r"\b\d{6,10}\b", texto):
+        t = m.group(0)
+        if 6 <= len(t) <= 10:
+            tokens.add(t)
+    # Ficha ("No. Grupo" seguido de número)
+    for m in re.finditer(r"(?:no\.?\s*grupo|grupo\s*no\.?|ficha)\s*[:#]?\s*(\d{5,8})", texto, re.I):
+        tokens.add(m.group(1))
+    return tokens
+
+
+# --- Evaluación de diligenciamiento del formato GFPI-F-023 V6 ---------------
+# Criterios basados en el formato oficial y el ejemplo entregado (S1_Junio.pdf):
+#   CRÍTICOS (el formato debe traerlos diligenciados):
+#     - Nombre completo del aprendiz
+#     - N° de identificación
+#     - No. Grupo (ficha)
+#     - Alternativa de etapa productiva registrada
+#     - Fecha inicio y fecha fin de etapa productiva
+#     - Nombre del instructor de seguimiento
+#     - Nombre de la empresa / ente co-formador
+#   NO CRÍTICOS (se reportan como observaciones, no bloquean):
+#     - Correo electrónico personal/institucional del aprendiz
+#     - Fecha de Registro en Sofia Plus
+#     - Fecha de afiliación ARL / número de póliza
+#     - Nombre del jefe inmediato del ente co-formador
+#   FIRMAS: se valida firma digital del PDF (las tres partes firman el mismo
+#           documento). Si no hay firma digital, queda como observación para
+#           revisión manual del equipo de coordinación.
+
+RE_GFPI_V6 = re.compile(r"GFPI[\s_\-]*F[\s_\-]*0?23[\s.]*V\s*6", re.I)
+
+CAMPOS_CRITICOS = [
+    ("nombre_aprendiz", re.compile(r"Nombre completo\s*:\s*([A-Za-zÁÉÍÓÚÑáéíóúñ][^:\n]{2,60})")),
+    ("cedula", re.compile(r"N[°º]?\s*de\s*identificaci[oó]n\s*:\s*(\d{6,10})")),
+    ("ficha", re.compile(r"No\.?\s*Grupo\s*:\s*(\d{5,8})")),
+    ("alternativa", re.compile(r"Alternativa de etapa productiva\s*registrada\s*:\s*([A-Za-zÁÉÍÓÚÑáéíóúñ][^:\n]{2,60})")),
+    ("fecha_inicio_ep", re.compile(r"Fecha inicio etapa\s*productiva\s*:[\s\S]{0,80}?(\d{1,2}/\d{1,2}/\d{2,4})")),
+    ("fecha_fin_ep", re.compile(r"Fecha fin de etapa\s*productiva\s*:[\s\S]{0,80}?(\d{1,2}/\d{1,2}/\d{2,4})")),
+    ("instructor", re.compile(r"Datos del\s*instructor de\s*seguimiento\s*:\s*Nombre\s*:\s*([^:\n]{3,60})")),
+    ("ente_coformador", re.compile(r"Nombre empresa o entidad co-?\s*formadora\s*:\s*([^:\n]{3,80})")),
+]
+
+CAMPOS_OBSERVACIONES = [
+    ("correo_aprendiz", re.compile(r"Correo electr[oó]nico personal\s*:\s*(\S+@\S+)")),
+    ("correo_institucional_aprendiz", re.compile(r"Correo electr[oó]nico institucional\s*:\s*(\S+@\S+)")),
+    ("fecha_registro_sofia", re.compile(r"Fecha de Registro en Sofia Plus\s*:\s*(\d{1,2}/\d{1,2}/\d{2,4})")),
+    ("fecha_arl", re.compile(r"Fecha de afiliaci[oó]n a la\s*ARL\s*:\s*(\d{1,2}/\d{1,2}/\d{2,4})")),
+    ("poliza_arl", re.compile(r"N[uú]mero de p[oó]liza ARL\s*:\s*(\S{3,30})")),
+    ("jefe_inmediato", re.compile(r"Nombre del jefe inmediato[^:\n]*:\s*([^:\n]{3,60})")),
+]
+
+NOMBRES_CAMPOS = {
+    "nombre_aprendiz": "Nombre del aprendiz",
+    "cedula": "Cédula",
+    "ficha": "Ficha (No. Grupo)",
+    "alternativa": "Alternativa registrada",
+    "fecha_inicio_ep": "Fecha inicio EP",
+    "fecha_fin_ep": "Fecha fin EP",
+    "instructor": "Instructor de seguimiento",
+    "ente_coformador": "Ente co-formador",
+    "correo_aprendiz": "Correo personal del aprendiz",
+    "correo_institucional_aprendiz": "Correo institucional del aprendiz",
+    "fecha_registro_sofia": "Fecha registro Sofia Plus",
+    "fecha_arl": "Fecha afiliación ARL",
+    "poliza_arl": "Póliza ARL",
+    "jefe_inmediato": "Jefe inmediato (ente)",
+}
+
+
+def evaluar_gfpi(texto, firmado_digital=False):
+    """
+    Determina si un archivo es un GFPI-F-023 V6 y evalúa su diligenciamiento.
+    Devuelve:
+      {
+        "es_gfpi_v6": bool,
+        "completo": bool,          # todos los campos críticos diligenciados
+        "faltantes": [nombres],    # campos críticos vacíos
+        "observaciones": [texto],  # no críticos vacíos + firma
+        "campos": {campo: valor},
+      }
+    """
+    if not texto:
+        return {"es_gfpi_v6": False, "completo": False, "faltantes": [],
+                "observaciones": [], "campos": {}}
+    plano = re.sub(r"\s+", " ", texto)
+    es_v6 = bool(RE_GFPI_V6.search(plano))
+    if not es_v6:
+        return {"es_gfpi_v6": False, "completo": False, "faltantes": [],
+                "observaciones": [], "campos": {}}
+    # Sección de datos del APRENDIZ: termina donde empieza la del instructor.
+    # (El formato repite "Correo electrónico institucional" en ambas secciones.)
+    seccion_aprendiz = re.split(r"Datos del\s*instructor de\s*seguimiento", plano, maxsplit=1)[0]
+    # Campos que viven ÚNICAMENTE en la sección del aprendiz
+    CAMPOS_SECCION_APRENDIZ = {
+        "nombre_aprendiz", "cedula", "ficha", "alternativa",
+        "correo_aprendiz", "correo_institucional_aprendiz", "fecha_registro_sofia",
+    }
+    campos = {}
+    faltantes = []
+    for nombre, rx in CAMPOS_CRITICOS:
+        scope = seccion_aprendiz if nombre in CAMPOS_SECCION_APRENDIZ else plano
+        m = rx.search(scope)
+        campos[nombre] = m.group(1).strip() if m else ""
+        if not m:
+            faltantes.append(NOMBRES_CAMPOS[nombre])
+    observaciones = []
+    for nombre, rx in CAMPOS_OBSERVACIONES:
+        scope = seccion_aprendiz if nombre in CAMPOS_SECCION_APRENDIZ else plano
+        m = rx.search(scope)
+        campos[nombre] = m.group(1).strip() if m else ""
+        if not m:
+            observaciones.append(f"Falta {NOMBRES_CAMPOS[nombre]}")
+    if not firmado_digital:
+        observaciones.append("Sin firma digital detectada (verificar firmas manualmente)")
+    completo = not faltantes
+    return {
+        "es_gfpi_v6": True,
+        "completo": completo,
+        "faltantes": faltantes,
+        "observaciones": observaciones,
+        "campos": campos,
+    }
+
+
+def escanear_contenido_gfpi(files, cache_file, forzar=False):
+    """
+    Revisa el CONTENIDO de todos los archivos .pdf/.docx/.doc para detectar el
+    texto 'GFPI-F-023 V6' (los archivos tienen nombres variados). Devuelve:
+      dict: ruta -> {"es_gfpi_v6", "completo", "faltantes", "observaciones",
+                     "ids": [tokens], "seg_nums": [1-3], "firmado": bool}
+    Usa caché por mtime para que las corridas semanales sean rápidas.
+    """
+    cache = {}
+    if cache_file and cache_file.exists() and not forzar:
+        try:
+            cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            cache = {}
+    print(f"  [Contenido] Revisando contenido de {len(files)} archivos "
+          f"(buscando 'GFPI-F-023 V6')... esto puede tomar unos minutos la primera vez.")
+    t0 = time.time()
+    resultados = {}
+    gfpi_count = 0
+    for i, f in enumerate(files, 1):
+        try:
+            st = f.stat()
+            clave = f"{st.st_mtime_ns}|{st.st_size}"
+        except OSError:
+            continue
+        entrada = cache.get(str(f))
+        if entrada and entrada.get("clave") == clave:
+            resultados[str(f)] = entrada.get("r", {})
+            if entrada.get("r", {}).get("es_gfpi_v6"):
+                gfpi_count += 1
+            continue
+        r = {"es_gfpi_v6": False, "completo": False, "faltantes": [],
+             "observaciones": [], "ids": [], "seg_nums": [], "firmado": False}
+        texto = ""
+        firmado = False
+        ext = f.suffix.lower()
+        if ext == ".pdf":
+            texto, firmado = extraer_texto_pdf(f)
+        elif ext == ".docx":
+            texto = extraer_texto_docx(f)
+        # .doc (legacy): sin lectura de contenido; queda por nombre únicamente
+        if texto:
+            ev = evaluar_gfpi(texto, firmado)
+            if ev["es_gfpi_v6"]:
+                r["es_gfpi_v6"] = True
+                r["completo"] = ev["completo"]
+                r["faltantes"] = ev["faltantes"]
+                r["observaciones"] = ev["observaciones"]
+                r["ids"] = sorted(extraer_identificadores_pdf(texto))
+                r["firmado"] = firmado
+                # número de seguimiento: del nombre y del contenido
+                segs = set()
+                n = normalizar(f.name)
+                for m in RE_GFPI_SEG_NOMBRE.finditer(n):
+                    num = int(m.group(1))
+                    if 1 <= num <= 3:
+                        segs.add(num)
+                for m in re.finditer(r"momento\s*n[°ºo]?\.?\s*(\d+)", texto, re.I):
+                    num = int(m.group(1))
+                    if 2 <= num <= 4:  # Momento 1 = planeación; 2/3/4 = seguimientos
+                        segs.add(num - 1)
+                r["seg_nums"] = sorted(segs)
+                gfpi_count += 1
+        resultados[str(f)] = r
+        cache[str(f)] = {"clave": clave, "r": r}
+        if i % 400 == 0:
+            print(f"    ...{i}/{len(files)} archivos revisados "
+                  f"({time.time() - t0:.0f}s, GFPI: {gfpi_count})")
+    if cache_file:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    print(f"  [Contenido] Revisión completa: {len(files)} archivos en {time.time() - t0:.1f}s. "
+          f"GFPI-F-023 V6 detectados: {gfpi_count}.")
+    return resultados
 
 
 def escanear_onedrive(root, extensiones, excluir_dirnames, cache_file, forzar=False):
@@ -393,8 +692,9 @@ def clasificar_fin_lectiva(fecha, hoy):
 # 6. CONSTRUCCIÓN DE EXPEDIENTES POR APRENDIZ
 # ----------------------------------------------------------------------------
 
-def construir_expedientes(df, files, idx):
-    """Construye la lista de expedientes (clave única FICHA + NUMERO_DOCUMENTO)."""
+def construir_expedientes(df, files, idx, gfpi_contenido=None):
+    """Construye la lista de expedientes (clave única FICHA + NUMERO_DOCUMENTO).
+    gfpi_contenido: dict ruta -> resultado de escanear_contenido_gfpi()."""
     cmap = mapear_columnas(df)
 
     def col(nombre):
@@ -432,6 +732,34 @@ def construir_expedientes(df, files, idx):
 
     hoy = datetime.now().date()
 
+    # --- Índice por CONTENIDO de formatos GFPI-F-023 V6 -------------------
+    # Los GFPI se detectan por su contenido (texto 'GFPI-F-023 V6'), ya que
+    # los archivos tienen nombres variados (S1_Junio.pdf, formatos escaneados, etc.).
+    gfpi_idx_contenido = defaultdict(set)   # token -> set de archivos GFPI (por ids del PDF)
+    gfpi_segs_contenido = {}                # archivo -> set números de seguimiento
+    gfpi_detalle = {}                       # archivo -> info de diligenciamiento
+    for f in files:
+        ruta = str(f)
+        info = (gfpi_contenido or {}).get(ruta) or {}
+        if not info.get("es_gfpi_v6"):
+            continue
+        segs = set(info.get("seg_nums") or [])
+        # complementa con el número detectado en el nombre (S1_, S2_, S3_)
+        n = normalizar(f.name)
+        for m in RE_GFPI_SEG_NOMBRE.finditer(n):
+            num = int(m.group(1))
+            if 1 <= num <= 3:
+                segs.add(num)
+        gfpi_segs_contenido[ruta] = segs
+        gfpi_detalle[ruta] = {
+            "completo": info.get("completo", False),
+            "faltantes": info.get("faltantes", []),
+            "observaciones": info.get("observaciones", []),
+            "firmado": info.get("firmado", False),
+        }
+        for tok in info.get("ids", []):
+            gfpi_idx_contenido[tok].add(f)
+
     expedientes, vistos, duplicados = [], set(), 0
     for _, row in df.iterrows():
         ficha = texto(row, c_ficha) if c_ficha else ""
@@ -443,17 +771,40 @@ def construir_expedientes(df, files, idx):
         vistos.add(clave)
 
         # --- Archivos del aprendiz en OneDrive ----------------------------
-        archivos = buscar_archivos_aprendiz(idx, files, ficha, doc)
+        # 1) Coincidencia por nombre/ruta (cédula o ficha)
+        archivos = set(buscar_archivos_aprendiz(idx, files, ficha, doc))
+        # 2) Coincidencia por CONTENIDO (formato GFPI-F-023 V6 sin cédula en el nombre)
+        for tok in {solo_digitos(ficha), solo_digitos(doc)}:
+            if len(tok) >= 6:
+                archivos |= gfpi_idx_contenido.get(tok, set())
+        archivos = sorted(archivos, key=lambda x: str(x).lower())
         clasificados = [(f, clasificar_archivo(f.name)) for f in archivos]
 
         docs_inicio = [f for f, c in clasificados if c["inicio"]]
         docs_alt = [f for f, c in clasificados if c["inicio"] and not c["arl"]]
         docs_arl = [f for f, c in clasificados if c["arl"]]
         docs_bit = [f for f, c in clasificados if c["bitacora_nums"]]
+        # Seguimientos: SOLO el formato GFPI-F-023 V6 (detectado por contenido)
+        # acredita un seguimiento realizado.
         docs_seg = {}
         for n in (1, 2, 3):
-            docs_seg[n] = [f for f, c in clasificados if n in c["seg_nums"]]
+            docs_seg[n] = [
+                f for f, _ in clasificados
+                if str(f) in gfpi_segs_contenido and n in gfpi_segs_contenido[str(f)]
+            ]
         docs_cierre = [f for f, c in clasificados if c["cierre"]]
+
+        # Detalle de diligenciamiento por seguimiento
+        seg_gfpi = {n: [] for n in (1, 2, 3)}
+        for n in (1, 2, 3):
+            for f in docs_seg[n]:
+                seg_gfpi[n].append({
+                    "ruta": str(f),
+                    "completo": gfpi_detalle.get(str(f), {}).get("completo", False),
+                    "faltantes": gfpi_detalle.get(str(f), {}).get("faltantes", []),
+                    "observaciones": gfpi_detalle.get(str(f), {}).get("observaciones", []),
+                    "firmado": gfpi_detalle.get(str(f), {}).get("firmado", False),
+                })
 
         # --- Fuentes CSV ---------------------------------------------------
         alt_csv = texto(row, c_alt) if c_alt else ""
@@ -490,7 +841,17 @@ def construir_expedientes(df, files, idx):
         # --- Consolidación (CSV + OneDrive combinados) ---------------------
         alternativa_ok = bool(alt_csv) or bool(docs_alt)
         arl_ok = bool(arl_csv) or bool(docs_arl)
-        seg_ok = {n: bool(seg_csv[n] or docs_seg[n]) for n in (1, 2, 3)}
+        # Seguimiento REALIZADO = formato GFPI-F-023 V6 encontrado Y completo.
+        # Si el formato existe pero está incompleto -> parcial (con observaciones).
+        seg_realizado = {}
+        seg_incompleto = {}
+        for n in (1, 2, 3):
+            docs_n = seg_gfpi[n]
+            seg_realizado[n] = bool(docs_n) and any(d["completo"] for d in docs_n)
+            seg_incompleto[n] = bool(docs_n) and not seg_realizado[n]
+        seg_asignado = {n: bool(seg_csv[n]) and not seg_realizado[n] and not seg_incompleto[n]
+                        for n in (1, 2, 3)}
+        seg_ok = seg_realizado
         tiene_docs = bool(archivos)
         tiene_seg_csv = any(seg_csv.values())
         cierre_ok = cierre_csv or bool(docs_cierre)
@@ -521,7 +882,15 @@ def construir_expedientes(df, files, idx):
             "empresa": texto(row, c_emp) if c_emp else "",
             "arl": arl_csv,
             "arl_ok": arl_ok,
-            "seg": {n: {"ok": seg_ok[n], "csv": seg_csv[n]} for n in (1, 2, 3)},
+            "seg": {
+                n: {
+                    "ok": seg_realizado[n],        # GFPI-F-023 V6 completo
+                    "incompleto": seg_incompleto[n],  # GFPI existe pero con faltantes
+                    "asignado": seg_asignado[n],  # CSV con instructor/fecha pero sin formato
+                    "csv": seg_csv[n],
+                    "gfpi": seg_gfpi[n],          # detalle de diligenciamiento
+                } for n in (1, 2, 3)
+            },
             "bitacoras_ok": bool(docs_bit),
             "bitacoras_n": len(docs_bit),
             "cierre_ok": cierre_ok,
@@ -654,6 +1023,8 @@ def calcular_kpis(expedientes):
     total = len(expedientes) or 1
     n_alt = sum(1 for e in expedientes if e["alternativa_ok"])
     n_seg = {n: sum(1 for e in expedientes if e["seg"][n]["ok"]) for n in (1, 2, 3)}
+    n_seg_asig = {n: sum(1 for e in expedientes if e["seg"][n]["asignado"]) for n in (1, 2, 3)}
+    n_seg_inc = {n: sum(1 for e in expedientes if e["seg"][n]["incompleto"]) for n in (1, 2, 3)}
     n_estado = defaultdict(int)
     for e in expedientes:
         n_estado[e["estado"]] += 1
@@ -682,6 +1053,12 @@ def calcular_kpis(expedientes):
         "pct_seg1": pct(n_seg[1]),
         "pct_seg2": pct(n_seg[2]),
         "pct_seg3": pct(n_seg[3]),
+        "n_seg1_asig": n_seg_asig[1],
+        "n_seg2_asig": n_seg_asig[2],
+        "n_seg3_asig": n_seg_asig[3],
+        "n_seg1_inc": n_seg_inc[1],
+        "n_seg2_inc": n_seg_inc[2],
+        "n_seg3_inc": n_seg_inc[3],
         "n_al_dia": n_al_dia,
         "n_en_proceso": n_estado.get("EN PROCESO", 0),
         "n_alerta": n_estado.get("ALERTA", 0),
@@ -791,6 +1168,8 @@ PLANTILLA_HTML = r"""<!DOCTYPE html>
   .seg-cell{display:inline-flex;align-items:center;gap:3px;margin:1px 2px;font-size:11.5px;font-weight:700;
          padding:2px 7px;border-radius:12px;}
   .seg-ok{background:#E3F5D8;color:#1E7A00;} .seg-no{background:#FDE4E4;color:var(--rojo);}
+  .seg-par{background:#FFF3CC;color:#8F6A00;}
+  .seg-asg{background:#FDEBD0;color:#B9770E;}
   .estado{display:inline-block;font-weight:800;font-size:12px;padding:5px 12px;border-radius:16px;
          color:#fff;white-space:nowrap;}
   .est-AL{background:var(--verde);} .est-EN{background:var(--amarillo);} .est-ALERTA{background:var(--rojo);}
@@ -885,7 +1264,9 @@ PLANTILLA_HTML = r"""<!DOCTYPE html>
     <span>⚠️ Parcial / Próximo a vencer</span>
     <span>❌ Pendiente / Vencido</span>
     <span>·</span>
-    <span>🟢 AL DÍA: alternativa + ARL + seguimientos 1·2·3</span>
+    <span>📝 Seguimiento realizado = formato <b>GFPI-F-023 V6</b> encontrado (S1/S2/S3); instructor en CSV sin formato = ⚠️</span>
+    <span>·</span>
+    <span>🟢 AL DÍA: alternativa + ARL + seguimientos 1·2·3 (GFPI-F-023)</span>
     <span>🟡 EN PROCESO: alternativa registrada o plazo de selección vigente, seguimientos pendientes</span>
     <span>🔴 ALERTA: sin alternativa con plazo vencido, sin ARL, sin documentos o EP vencida sin cierre</span>
     <span>·</span>
@@ -963,9 +1344,11 @@ function renderKPIs(){
       <div class="valor">${k.total}</div><div class="mini"><b>${k.total_fichas}</b> fichas activas</div></div>
     <div class="kpi"><div class="titulo">Alternativa Registrada</div>
       <div class="valor">${k.pct_alternativa}%</div><div class="mini">de los aprendices virtuales</div></div>
-    <div class="kpi amber"><div class="titulo">Seguimientos Asignados</div>
+    <div class="kpi amber"><div class="titulo">Seguimientos Realizados (GFPI-F-023)</div>
       <div class="valor">${k.pct_seg1}% · ${k.pct_seg2}% · ${k.pct_seg3}%</div>
-      <div class="mini"><b>1.º</b> ${k.pct_seg1}% &nbsp;·&nbsp; <b>2.º</b> ${k.pct_seg2}% &nbsp;·&nbsp; <b>3.º</b> ${k.pct_seg3}%</div></div>
+      <div class="mini"><b>1.º</b> ${k.pct_seg1}% (asig: ${k.n_seg1_asig}, inc: ${k.n_seg1_inc}) &nbsp;·&nbsp;
+      <b>2.º</b> ${k.pct_seg2}% (asig: ${k.n_seg2_asig}, inc: ${k.n_seg2_inc}) &nbsp;·&nbsp;
+      <b>3.º</b> ${k.pct_seg3}% (asig: ${k.n_seg3_asig}, inc: ${k.n_seg3_inc})</div></div>
     <div class="kpi ${k.pct_completos >= 60 ? '' : 'red'}"><div class="titulo">Expedientes</div>
       <div class="valor">${k.pct_completos}%</div>
       <div class="mini"><b>Completos:</b> ${k.n_al_dia} (${k.pct_completos}%) &nbsp;·&nbsp;
@@ -1062,9 +1445,26 @@ function celdaSeguimientos(d){
   const labels = ["1.º", "2.º", "3.º"];
   return [1,2,3].map(n => {
     const s = d.seg[n];
-    const cls = s.ok ? "seg-ok" : "seg-no";
-    const ico = s.ok ? ICON_OK : ICON_NO;
-    return `<span class="seg-cell ${cls}" title="Seguimiento ${n}">${labels[n-1]} ${ico}</span>`;
+    let cls, ico, titulo;
+    if (s.ok){
+      cls = "seg-ok"; ico = ICON_OK;
+      titulo = `Seguimiento ${n}: GFPI-F-023 V6 completo`;
+    } else if (s.incompleto){
+      cls = "seg-par"; ico = ICON_PAR;
+      const det = (s.gfpi && s.gfpi[0]) ? s.gfpi[0] : null;
+      const falt = det && det.faltantes && det.faltantes.length ? det.faltantes.join(", ") : "";
+      const obs = det && det.observaciones && det.observaciones.length ? det.observaciones.join("; ") : "";
+      titulo = `Seguimiento ${n}: GFPI-F-023 V6 incompleto` +
+               (falt ? ` — faltan: ${falt}` : "") +
+               (obs ? ` — obs: ${obs}` : "");
+    } else if (s.asignado){
+      cls = "seg-asg"; ico = ICON_PAR;
+      titulo = `Seguimiento ${n}: instructor asignado en CSV, sin formato GFPI-F-023`;
+    } else {
+      cls = "seg-no"; ico = ICON_NO;
+      titulo = `Seguimiento ${n}: pendiente (sin formato GFPI-F-023)`;
+    }
+    return `<span class="seg-cell ${cls}" title="${titulo}">${labels[n-1]} ${ico}</span>`;
   }).join("");
 }
 
@@ -1079,17 +1479,29 @@ function listaArchivos(lista, etiqueta, icono){
     <ul>${items}${extra > 0 ? `<li>+ ${extra} más…</li>` : ""}</ul></details>`;
 }
 
+function listaArchivosGFPI(d, n, etiqueta, icono){
+  const info = (d.seg[n].gfpi || []).map(g => ({ruta: g.ruta, completo: g.completo}));
+  if (!info.length) return `<span class="chip no">${ICON_NO} ${etiqueta}</span>`;
+  const items = info.map(g => {
+    const estado = g.completo
+      ? `<span class="chip ok">${ICON_OK} completo</span>`
+      : `<span class="chip parcial">${ICON_PAR} incompleto</span>`;
+    return `<li>${estado} <a href="${fileUri(g.ruta)}" target="_blank" rel="noopener"
+      title="${esc(g.ruta)}">${esc(g.ruta.split(/[\\/]/).pop())}</a></li>`;
+  }).join("");
+  return `<details><summary>${icono} ${etiqueta} (${info.length})</summary><ul>${items}</ul></details>`;
+}
+
 function celdaSoportes(d){
   const a = d.archivos;
   const partes = [];
   if (a.inicio.length) partes.push(listaArchivos(a.inicio, "Inicio", "🚀"));
   if (a.arl.length) partes.push(listaArchivos(a.arl, "ARL", "🛡️"));
   if (a.bitacoras.length) partes.push(listaArchivos(a.bitacoras, `Bitácoras (${a.bitacoras.length})`, "📒"));
-  if (a.seg1.length) partes.push(listaArchivos(a.seg1, "Seguimiento 1", "1️⃣"));
-  if (a.seg2.length) partes.push(listaArchivos(a.seg2, "Seguimiento 2", "2️⃣"));
-  if (a.seg3.length) partes.push(listaArchivos(a.seg3, "Seguimiento 3", "3️⃣"));
+  partes.push(listaArchivosGFPI(d, 1, "GFPI S1", "1️⃣"));
+  partes.push(listaArchivosGFPI(d, 2, "GFPI S2", "2️⃣"));
+  partes.push(listaArchivosGFPI(d, 3, "GFPI S3", "3️⃣"));
   if (a.cierre.length) partes.push(listaArchivos(a.cierre, "Cierre", "🏁"));
-  if (!partes.length) return `<span class="chip no">${ICON_NO} Sin soportes</span>`;
   return `<div class="soportes">${partes.join("")}</div>`;
 }
 
@@ -1320,6 +1732,7 @@ def main():
 
     raiz = Path(__file__).resolve().parent.parent
     CONFIG["cache_index"] = raiz / "data" / "onedrive_index.json"
+    CONFIG["cache_contenido"] = raiz / "data" / "gfpi_contenido_cache.json"
     CONFIG["output_html"] = raiz / "dashboard_etapa_productiva_virtual.html"
     CONFIG["resumen_dir"] = raiz / "outputs"
 
@@ -1327,10 +1740,11 @@ def main():
     print(" SENA CENTRO ASTIN · Generador del Dashboard de Etapa Productiva Virtual")
     print("=" * 78)
 
-    # --- Lectura del CSV -----------------------------------------------------
+    # --- Lectura de la base de datos (Excel OneDrive/SharePoint primario) ------
     print("[1/4] Leyendo base de datos...")
-    df = leer_base_datos(CONFIG["csv_path"])
-    print(f"       Filas totales en CSV: {len(df)}")
+    df, origen = leer_base_datos(CONFIG["csv_path"], CONFIG["excel_path"])
+    print(f"       Fuente: {origen}")
+    print(f"       Filas totales: {len(df)}")
     virtuales = filtrar_virtuales(df)
     print(f"       Aprendices MODALIDAD='VIRTUAL': {len(virtuales)}")
     if args.solo_validar:
@@ -1346,7 +1760,7 @@ def main():
     # --- Escaneo de OneDrive --------------------------------------------------
     print("[2/4] Escaneando OneDrive...")
     if args.no_scan:
-        files, idx = [], defaultdict(set)
+        files, idx, gfpi_contenido = [], defaultdict(set), {}
         print("       Escaneo omitido (--no-scan).")
     else:
         files = escanear_onedrive(
@@ -1354,10 +1768,14 @@ def main():
             CONFIG["excluir_dirnames"], CONFIG["cache_index"], forzar=args.rescan,
         )
         idx = construir_indice(files)
+        # Revisión de CONTENIDO: busca el texto 'GFPI-F-023 V6' dentro de los archivos
+        gfpi_contenido = escanear_contenido_gfpi(
+            files, CONFIG["cache_contenido"], forzar=args.rescan,
+        )
 
     # --- Expedientes y KPIs ----------------------------------------------------
     print("[3/4] Construyendo expedientes (clave FICHA + DOCUMENTO)...")
-    expedientes, duplicados = construir_expedientes(virtuales, files, idx)
+    expedientes, duplicados = construir_expedientes(virtuales, files, idx, gfpi_contenido)
     kpis = calcular_kpis(expedientes)
     print(f"       Expedientes: {len(expedientes)} | Duplicados omitidos: {duplicados}")
     print(f"       AL DÍA: {kpis['n_al_dia']} | EN PROCESO: {kpis['n_en_proceso']} | "
@@ -1378,6 +1796,7 @@ def main():
     CONFIG["resumen_dir"].mkdir(parents=True, exist_ok=True)
     resumen = {
         "generado": datetime.now().isoformat(timespec="seconds"),
+        "fuente": origen,
         "csv_filas": len(df),
         "virtuales": len(virtuales),
         "expedientes": len(expedientes),
